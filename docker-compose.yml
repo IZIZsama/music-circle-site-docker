@@ -1,0 +1,55 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: band-practice-mysql
+    environment:
+      - MYSQL_ROOT_PASSWORD=bandpractice
+      - MYSQL_DATABASE=band_practice
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pbandpractice"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    container_name: band-practice-server
+    environment:
+      - PORT=3001
+      - CLIENT_ORIGIN=http://localhost:5173
+      - DATABASE_URL=mysql://root:bandpractice@mysql:3306/band_practice
+      - SESSION_SECRET=docker-dev-secret
+    volumes:
+      - ./server:/app/server
+      - server_node_modules:/app/server/node_modules
+    ports:
+      - "3001:3001"
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  client:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    container_name: band-practice-client
+    environment:
+      - VITE_PROXY_TARGET=http://server:3001
+    volumes:
+      - ./client:/app/client
+      - client_node_modules:/app/client/node_modules
+    ports:
+      - "5173:5173"
+    depends_on:
+      - server
+
+volumes:
+  mysql_data:
+  server_node_modules:
+  client_node_modules:
