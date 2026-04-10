@@ -1,18 +1,18 @@
 import './env.js';
-import './mysql.js';
+import { pingDb } from './db.js';
+
 import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-if (!process.env.DATABASE_URL) {
-  console.warn('DATABASE_URL が未設定です。server/.env に MySQL 接続情報を設定してください。');
+if (!process.env.DATABASE_URL && !process.env.DB_HOST) {
+  console.warn('DATABASE_URL または DB_* が未設定です。server/.env を確認してください。');
 }
 
 import express from 'express';
 import cors from 'cors';
 import cookieParser from 'cookie-parser';
 import session from 'express-session';
-import { PrismaClient } from '@prisma/client';
 import authRoutes from './routes/auth.js';
 import userRoutes from './routes/users.js';
 import bandRoutes from './routes/bands.js';
@@ -20,7 +20,6 @@ import reservationRoutes from './routes/reservations.js';
 import rankingRoutes from './routes/ranking.js';
 import adminRoutes from './routes/admin.js';
 
-const prisma = new PrismaClient();
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3001;
 
@@ -49,12 +48,12 @@ app.use('/api/admin', adminRoutes);
 
 async function start() {
   try {
-    await prisma.$connect();
+    await pingDb();
     console.log('Database connected.');
   } catch (e) {
     console.error('Database connection failed:', e.message);
     console.error('DATABASE_URL:', process.env.DATABASE_URL);
-    console.error('対処: MySQL起動後に server フォルダで npx prisma db push を実行してください。');
+    console.error('対処: MySQL 起動後、初回は server/sql/init を docker-entrypoint-initdb.d にマウントするか、手動でスキーマを流し込んでください。');
     process.exit(1);
   }
 

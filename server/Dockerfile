@@ -9,4 +9,4 @@ COPY . .
 
 EXPOSE 3001
 
-CMD ["sh", "-c", "npx prisma generate && npx prisma db push && npm run db:seed; npm run dev"]
+CMD ["npm", "run", "dev"]

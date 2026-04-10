@@ -1,13 +1,37 @@
 import { Router } from 'express';
+import { randomUUID } from 'crypto';
 import bcrypt from 'bcryptjs';
-import { PrismaClient } from '@prisma/client';
 import crypto from 'crypto';
 import nodemailer from 'nodemailer';
+import { pool } from '../db.js';
 
-const prisma = new PrismaClient();
 const router = Router();
 
-// Gmail: SMTP_URL の代わりに MAIL_APP_PASSWORD を使うとパスワードの記号を気にしなくてよい
+export async function fetchUserWithBands(userId) {
+  const [users] = await pool.query(
+    `SELECT u.id, u.name, u.studentId, u.email, u.iconPath, u.isAdmin, u.instruments
+     FROM \`User\` u WHERE u.id = ? LIMIT 1`,
+    [userId],
+  );
+  const user = users[0];
+  if (!user) return null;
+  const [bands] = await pool.query(
+    `SELECT b.id, b.name, b.createdAt FROM \`Band\` b
+     INNER JOIN \`UserBand\` ub ON ub.bandId = b.id WHERE ub.userId = ? ORDER BY b.name ASC`,
+    [userId],
+  );
+  return {
+    id: user.id,
+    name: user.name,
+    studentId: user.studentId,
+    email: user.email,
+    iconPath: user.iconPath,
+    isAdmin: Boolean(user.isAdmin),
+    instruments: JSON.parse(user.instruments),
+    bands,
+  };
+}
+
 function getTransportOptions() {
   if (process.env.SMTP_URL) return process.env.SMTP_URL;
   if (process.env.MAIL_APP_PASSWORD && process.env.MAIL_FROM) {
@@ -32,7 +56,6 @@ function sendResetEmail(to, code) {
   });
 }
 
-// 登録
 router.post('/register', async (req, res) => {
   try {
     const { name, studentId, email, password, bandIds, instruments, iconPath } = req.body;
@@ -42,10 +65,11 @@ router.post('/register', async (req, res) => {
     if (String(password).length < 6) {
       return res.status(400).json({ error: 'パスワードは6文字以上にしてください' });
     }
-    const existing = await prisma.user.findFirst({
-      where: { OR: [{ studentId }, { email }] },
-    });
-    if (existing) {
+    const [dup] = await pool.query(
+      'SELECT id FROM `User` WHERE studentId = ? OR email = ? LIMIT 1',
+      [studentId, email],
+    );
+    if (dup.length) {
       return res.status(400).json({ error: '学籍番号またはメールアドレスは既に使用されています' });
     }
     const inst = Array.isArray(instruments) ? instruments : (instruments ? JSON.parse(instruments) : []);
@@ -53,46 +77,29 @@ router.post('/register', async (req, res) => {
       return res.status(400).json({ error: '担当楽器を1つ以上選択してください' });
     }
     const hash = await bcrypt.hash(password, 10);
-    const user = await prisma.user.create({
-      data: {
-        name,
-        studentId,
-        email,
-        passwordHash: hash,
-        iconPath: iconPath || '',
-        instruments: JSON.stringify(inst),
-      },
-    });
+    const id = randomUUID();
+    await pool.execute(
+      `INSERT INTO \`User\` (id, name, studentId, email, passwordHash, iconPath, instruments)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, name, studentId, email, hash, iconPath || '', JSON.stringify(inst)],
+    );
     if (bandIds && bandIds.length) {
-      await prisma.userBand.createMany({
-        data: bandIds.map((bandId) => ({ userId: user.id, bandId })),
-      });
+      const values = bandIds.map((bandId) => [id, bandId]);
+      await pool.query(
+        'INSERT INTO `UserBand` (userId, bandId) VALUES ?',
+        [values],
+      );
     }
-    req.session.userId = user.id;
-    req.session.isAdmin = user.isAdmin;
-    const withBands = await prisma.user.findUnique({
-      where: { id: user.id },
-      include: { bands: { include: { band: true } } },
-    });
-    res.json({
-      user: {
-        id: withBands.id,
-        name: withBands.name,
-        studentId: withBands.studentId,
-        email: withBands.email,
-        iconPath: withBands.iconPath,
-        isAdmin: withBands.isAdmin,
-        instruments: JSON.parse(withBands.instruments),
-        bands: withBands.bands.map((ub) => ub.band),
-      },
-    });
+    req.session.userId = id;
+    req.session.isAdmin = false;
+    const withBands = await fetchUserWithBands(id);
+    res.json({ user: withBands });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: '登録に失敗しました' });
   }
 });
 
-// ログイン（学籍番号またはメールアドレス + パスワード）
 router.post('/login', async (req, res) => {
   try {
     const { studentId, password, login } = req.body;
@@ -101,15 +108,25 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ error: '学籍番号（またはメール）とパスワードを入力してください' });
     }
     const isEmail = String(loginId).includes('@');
-    const user = await prisma.user.findFirst({
-      where: isEmail ? { email: loginId } : { studentId: loginId },
-      include: { bands: { include: { band: true } } },
-    });
+    const [rows] = await pool.query(
+      isEmail
+        ? `SELECT u.id, u.name, u.studentId, u.email, u.iconPath, u.isAdmin, u.passwordHash, u.instruments
+           FROM \`User\` u WHERE u.email = ? LIMIT 1`
+        : `SELECT u.id, u.name, u.studentId, u.email, u.iconPath, u.isAdmin, u.passwordHash, u.instruments
+           FROM \`User\` u WHERE u.studentId = ? LIMIT 1`,
+      [loginId],
+    );
+    const user = rows[0];
     if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
       return res.status(401).json({ error: '学籍番号（またはメール）またはパスワードが正しくありません' });
     }
     req.session.userId = user.id;
-    req.session.isAdmin = user.isAdmin;
+    req.session.isAdmin = Boolean(user.isAdmin);
+    const [bands] = await pool.query(
+      `SELECT b.id, b.name, b.createdAt FROM \`Band\` b
+       INNER JOIN \`UserBand\` ub ON ub.bandId = b.id WHERE ub.userId = ? ORDER BY b.name ASC`,
+      [user.id],
+    );
     res.json({
       user: {
         id: user.id,
@@ -117,66 +134,52 @@ router.post('/login', async (req, res) => {
         studentId: user.studentId,
         email: user.email,
         iconPath: user.iconPath,
-        isAdmin: user.isAdmin,
+        isAdmin: Boolean(user.isAdmin),
         instruments: JSON.parse(user.instruments),
-        bands: user.bands.map((ub) => ub.band),
+        bands,
       },
     });
   } catch (e) {
     console.error(e);
-    const isDbError = e.code === 'P1001' || e.code === 'P1002' || e.message?.includes('SQLITE');
+    const isDbError = e.code === 'ECONNREFUSED' || e.code === 'ETIMEDOUT' || e.code === 'PROTOCOL_CONNECTION_LOST';
     res.status(isDbError ? 503 : 500).json({
       error: isDbError ? 'データベースに接続できません。サーバーを確認するか、しばらくしてからお試しください。' : 'ログインに失敗しました',
     });
   }
 });
 
-// ログアウト
 router.post('/logout', (req, res) => {
   req.session.destroy(() => {});
   res.json({ ok: true });
 });
 
-// 現在ユーザー
 router.get('/me', async (req, res) => {
   if (!req.session?.userId) {
     return res.status(401).json({ error: '未ログイン' });
   }
-  const user = await prisma.user.findUnique({
-    where: { id: req.session.userId },
-    include: { bands: { include: { band: true } } },
-  });
+  const user = await fetchUserWithBands(req.session.userId);
   if (!user) return res.status(401).json({ error: 'ユーザーが見つかりません' });
-  res.json({
-    user: {
-      id: user.id,
-      name: user.name,
-      studentId: user.studentId,
-      email: user.email,
-      iconPath: user.iconPath,
-      isAdmin: user.isAdmin,
-      instruments: JSON.parse(user.instruments),
-      bands: user.bands.map((ub) => ub.band),
-    },
-  });
+  res.json({ user });
 });
 
-// パスワード忘れ: 認証コード送信
 router.post('/forgot-password', async (req, res) => {
   try {
     const { email } = req.body;
     if (!email) return res.status(400).json({ error: 'メールアドレスを入力してください' });
-    const user = await prisma.user.findUnique({ where: { email } });
+    const [rows] = await pool.query('SELECT id, email FROM `User` WHERE email = ? LIMIT 1', [email]);
+    const user = rows[0];
     if (!user) {
       return res.json({ message: '該当するメールアドレスに認証コードを送信しました' });
     }
     const code = crypto.randomBytes(4).toString('hex').toUpperCase();
     const expiresAt = new Date(Date.now() + 15 * 60 * 1000);
-    await prisma.passwordReset.upsert({
-      where: { userId: user.id },
-      create: { email, code, expiresAt, userId: user.id },
-      update: { code, expiresAt },
-    });
+    const prId = randomUUID();
+    await pool.execute(
+      `INSERT INTO \`PasswordReset\` (id, email, code, expiresAt, userId)
+       VALUES (?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE email = VALUES(email), code = VALUES(code), expiresAt = VALUES(expiresAt)`,
+      [prId, email, code, expiresAt, user.id],
+    );
     try {
       await sendResetEmail(user.email, code);
     } catch (mailErr) {
@@ -194,7 +197,6 @@ router.post('/forgot-password', async (req, res) => {
   }
 });
 
-// 認証コード確認 & パスワード再設定
 router.post('/reset-password', async (req, res) => {
   try {
     const { email, code, newPassword } = req.body;
@@ -204,19 +206,18 @@ router.post('/reset-password', async (req, res) => {
     if (String(newPassword).length < 6) {
       return res.status(400).json({ error: 'パスワードは6文字以上にしてください' });
     }
-    const reset = await prisma.passwordReset.findFirst({
-      where: { email, code },
-      include: { user: true },
-    });
-    if (!reset || reset.expiresAt < new Date()) {
+    const [resets] = await pool.query(
+      `SELECT pr.id, pr.userId, pr.expiresAt FROM \`PasswordReset\` pr
+       WHERE pr.email = ? AND pr.code = ? LIMIT 1`,
+      [email, code],
+    );
+    const reset = resets[0];
+    if (!reset || new Date(reset.expiresAt) < new Date()) {
       return res.status(400).json({ error: '認証コードが無効または期限切れです' });
     }
     const hash = await bcrypt.hash(newPassword, 10);
-    await prisma.user.update({
-      where: { id: reset.userId },
-      data: { passwordHash: hash },
-    });
-    await prisma.passwordReset.delete({ where: { id: reset.id } });
+    await pool.execute('UPDATE `User` SET passwordHash = ? WHERE id = ?', [hash, reset.userId]);
+    await pool.execute('DELETE FROM `PasswordReset` WHERE id = ?', [reset.id]);
     res.json({ message: 'パスワードを再設定しました' });
   } catch (e) {
     console.error(e);

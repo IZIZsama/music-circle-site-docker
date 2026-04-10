@@ -1,19 +1,15 @@
 import { Router } from 'express';
-import { PrismaClient } from '@prisma/client';
+import { pool } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 
-const prisma = new PrismaClient();
 const router = Router();
 
-// 30分 = 1ポイント。予約時間(分)/30
 function scoreMinutes(minutes) {
   return Math.floor(minutes / 30);
 }
 
 router.get('/', requireAuth, async (req, res) => {
   const { period, type } = req.query;
-  // period: this_month | last_30_days | total
-  // type: user | band
   if (!period || !type) {
     return res.status(400).json({ error: 'period と type を指定してください' });
   }
@@ -31,24 +27,29 @@ router.get('/', requireAuth, async (req, res) => {
   }
 
   const isAdmin = req.session.isAdmin;
-  const limit = isAdmin ? undefined : 3; // メンバーはTOP3のみ
+  const limit = isAdmin ? undefined : 3;
 
   if (type === 'user') {
-    const reservations = await prisma.reservation.findMany({
-      where: { startAt: { gte: startDate } },
-      select: { userId: true, startAt: true, endAt: true },
-    });
+    const [reservations] = await pool.query(
+      `SELECT userId, startAt, endAt FROM \`Reservation\` WHERE startAt >= ?`,
+      [startDate],
+    );
     const byUser = {};
     reservations.forEach((r) => {
-      const min = (r.endAt - r.startAt) / (60 * 1000);
+      const min = (new Date(r.endAt) - new Date(r.startAt)) / (60 * 1000);
       const pts = scoreMinutes(min);
       byUser[r.userId] = (byUser[r.userId] || 0) + pts;
     });
     const userIds = Object.keys(byUser);
-    const users = await prisma.user.findMany({
-      where: { id: { in: userIds } },
-      select: { id: true, name: true, iconPath: true, studentId: true },
-    });
+    let users = [];
+    if (userIds.length) {
+      const ph = userIds.map(() => '?').join(',');
+      const [urows] = await pool.query(
+        `SELECT id, name, iconPath, studentId FROM \`User\` WHERE id IN (${ph})`,
+        userIds,
+      );
+      users = urows;
+    }
     const map = Object.fromEntries(users.map((u) => [u.id, u]));
     let ranking = userIds
       .map((uid) => ({ user: map[uid], score: byUser[uid] }))
@@ -70,35 +71,39 @@ router.get('/', requireAuth, async (req, res) => {
   }
 
   if (type === 'band') {
-    const reservations = await prisma.reservation.findMany({
-      where: {
-        startAt: { gte: startDate },
-        bandId: { not: null },
-      },
-      select: { bandId: true, startAt: true, endAt: true },
-    });
+    const [reservations] = await pool.query(
+      `SELECT bandId, startAt, endAt FROM \`Reservation\`
+       WHERE startAt >= ? AND bandId IS NOT NULL`,
+      [startDate],
+    );
     const byBand = {};
     reservations.forEach((r) => {
-      const min = (r.endAt - r.startAt) / (60 * 1000);
+      const min = (new Date(r.endAt) - new Date(r.startAt)) / (60 * 1000);
       const pts = scoreMinutes(min);
       byBand[r.bandId] = (byBand[r.bandId] || 0) + pts;
     });
     const bandIds = Object.keys(byBand);
-    const bands = await prisma.band.findMany({
-      where: { id: { in: bandIds } },
-      select: { id: true, name: true },
-    });
+    let bands = [];
+    if (bandIds.length) {
+      const ph = bandIds.map(() => '?').join(',');
+      const [brows] = await pool.query(
+        `SELECT id, name FROM \`Band\` WHERE id IN (${ph})`,
+        bandIds,
+      );
+      bands = brows;
+    }
     const map = Object.fromEntries(bands.map((b) => [b.id, b]));
     let ranking = bandIds
       .map((bid) => ({ band: map[bid], score: byBand[bid] }))
       .sort((a, b) => b.score - a.score);
     if (limit) ranking = ranking.slice(0, limit);
-    const myBands = await prisma.userBand.findMany({
-      where: { userId: req.session.userId },
-      include: { band: true },
-    });
+    const [myBands] = await pool.query(
+      `SELECT b.id, b.name, b.createdAt, ub.bandId FROM \`UserBand\` ub
+       INNER JOIN \`Band\` b ON b.id = ub.bandId WHERE ub.userId = ?`,
+      [req.session.userId],
+    );
     const myBandScores = myBands.map((ub) => ({
-      band: ub.band,
+      band: { id: ub.id, name: ub.name, createdAt: ub.createdAt },
       score: byBand[ub.bandId] || 0,
     }));
     return res.json({

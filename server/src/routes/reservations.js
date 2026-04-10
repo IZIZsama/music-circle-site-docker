@@ -1,19 +1,10 @@
 import { Router } from 'express';
-import { PrismaClient } from '@prisma/client';
-import { requireAuth, requireAdmin } from '../middleware/auth.js';
+import { randomUUID } from 'crypto';
+import { pool } from '../db.js';
+import { requireAuth } from '../middleware/auth.js';
 
-const prisma = new PrismaClient();
 const router = Router();
 
-function roundTo30Min(d) {
-  const t = new Date(d);
-  const min = t.getMinutes();
-  const rounded = min < 30 ? 0 : 30;
-  t.setMinutes(rounded, 0, 0);
-  return t;
-}
-
-// 翌月末 23:59:59
 function getAdminLimit(reservationDate) {
   const d = new Date(reservationDate);
   d.setMonth(d.getMonth() + 2);
@@ -22,7 +13,23 @@ function getAdminLimit(reservationDate) {
   return d;
 }
 
-// 月間カレンダー用: 日付ごとの予約件数
+function mapReservationRow(r) {
+  return {
+    id: r.id,
+    startAt: new Date(r.startAt).toISOString(),
+    endAt: new Date(r.endAt).toISOString(),
+    location: r.location,
+    band: r.bandId ? { id: r.bandId, name: r.bandName } : null,
+    memo: r.memo,
+    user: {
+      id: r.userId,
+      name: r.userName,
+      studentId: r.userStudentId,
+      iconPath: r.userIconPath,
+    },
+  };
+}
+
 router.get('/calendar', requireAuth, async (req, res) => {
   const { year, month } = req.query;
   if (!year || !month) return res.status(400).json({ error: 'year, month を指定してください' });
@@ -30,53 +37,40 @@ router.get('/calendar', requireAuth, async (req, res) => {
   const m = parseInt(month, 10) - 1;
   const start = new Date(y, m, 1);
   const end = new Date(y, m + 1, 0, 23, 59, 59, 999);
-  const list = await prisma.reservation.findMany({
-    where: {
-      startAt: { gte: start },
-      endAt: { lte: end },
-    },
-    select: { startAt: true },
-  });
+  const [list] = await pool.query(
+    `SELECT startAt FROM \`Reservation\`
+     WHERE startAt >= ? AND endAt <= ?`,
+    [start, end],
+  );
   const counts = {};
   list.forEach((r) => {
-    const key = `${r.startAt.getFullYear()}-${String(r.startAt.getMonth() + 1).padStart(2, '0')}-${String(r.startAt.getDate()).padStart(2, '0')}`;
+    const d = new Date(r.startAt);
+    const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
     counts[key] = (counts[key] || 0) + 1;
   });
   res.json({ counts });
 });
 
-// 日別予約一覧（時間昇順）
 router.get('/by-date', requireAuth, async (req, res) => {
   const { date } = req.query;
   if (!date) return res.status(400).json({ error: 'date (YYYY-MM-DD) を指定してください' });
   const [y, m, d] = date.split('-').map(Number);
   const start = new Date(y, m - 1, d, 0, 0, 0);
   const end = new Date(y, m - 1, d, 23, 59, 59);
-  const reservations = await prisma.reservation.findMany({
-    where: {
-      startAt: { gte: start },
-      endAt: { lte: end },
-    },
-    orderBy: { startAt: 'asc' },
-    include: {
-      user: { select: { id: true, name: true, studentId: true, iconPath: true } },
-      band: { select: { id: true, name: true } },
-    },
-  });
-  res.json({
-    reservations: reservations.map((r) => ({
-      id: r.id,
-      startAt: r.startAt.toISOString(),
-      endAt: r.endAt.toISOString(),
-      location: r.location,
-      band: r.band,
-      memo: r.memo,
-      user: r.user,
-    })),
-  });
+  const [rows] = await pool.query(
+    `SELECT r.id, r.startAt, r.endAt, r.location, r.memo, r.userId, r.bandId,
+            u.name AS userName, u.studentId AS userStudentId, u.iconPath AS userIconPath,
+            b.name AS bandName
+     FROM \`Reservation\` r
+     INNER JOIN \`User\` u ON u.id = r.userId
+     LEFT JOIN \`Band\` b ON b.id = r.bandId
+     WHERE r.startAt >= ? AND r.endAt <= ?
+     ORDER BY r.startAt ASC`,
+    [start, end],
+  );
+  res.json({ reservations: rows.map(mapReservationRow) });
 });
 
-// 予約作成（自動承認・予約者=ログインユーザー）
 router.post('/', requireAuth, async (req, res) => {
   try {
     const { startAt, endAt, location, bandId, memo } = req.body;
@@ -96,55 +90,51 @@ router.post('/', requireAuth, async (req, res) => {
       return res.status(403).json({ error: '過去の日付への予約追加は管理者のみ可能です' });
     }
     if (location === 'ROOM_802_FRONT') {
-      const overlap = await prisma.reservation.findFirst({
-        where: {
-          location: 'ROOM_802_FRONT',
-          startAt: { lt: end },
-          endAt: { gt: start },
-        },
-      });
-      if (overlap) {
+      const [overlap] = await pool.query(
+        `SELECT id FROM \`Reservation\`
+         WHERE location = 'ROOM_802_FRONT' AND startAt < ? AND endAt > ? LIMIT 1`,
+        [end, start],
+      );
+      if (overlap.length) {
         return res.status(400).json({ error: '802前方はこの時間帯に既に予約があります。重複予約はできません。' });
       }
     }
-    const reservation = await prisma.reservation.create({
-      data: {
-        startAt: start,
-        endAt: end,
-        location,
-        bandId: bandId || null,
-        memo: memo || null,
-        userId: req.session.userId,
-      },
-      include: {
-        user: { select: { id: true, name: true, studentId: true, iconPath: true } },
-        band: { select: { id: true, name: true } },
-      },
-    });
-    res.status(201).json({
-      reservation: {
-        id: reservation.id,
-        startAt: reservation.startAt.toISOString(),
-        endAt: reservation.endAt.toISOString(),
-        location: reservation.location,
-        band: reservation.band,
-        memo: reservation.memo,
-        user: reservation.user,
-      },
-    });
+    const id = randomUUID();
+    await pool.execute(
+      `INSERT INTO \`Reservation\` (id, startAt, endAt, location, bandId, memo, userId)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, start, end, location, bandId || null, memo || null, req.session.userId],
+    );
+    const [rows] = await pool.query(
+      `SELECT r.id, r.startAt, r.endAt, r.location, r.memo, r.userId, r.bandId,
+              u.name AS userName, u.studentId AS userStudentId, u.iconPath AS userIconPath,
+              b.name AS bandName
+       FROM \`Reservation\` r
+       INNER JOIN \`User\` u ON u.id = r.userId
+       LEFT JOIN \`Band\` b ON b.id = r.bandId
+       WHERE r.id = ?`,
+      [id],
+    );
+    res.status(201).json({ reservation: mapReservationRow(rows[0]) });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: '予約に失敗しました' });
   }
 });
 
-// 予約編集
 router.patch('/:id', requireAuth, async (req, res) => {
   const id = req.params.id;
-  const reservation = await prisma.reservation.findUnique({
-    where: { id },
-    include: { user: true },
-  });
+  const [prevRows] = await pool.query(
+    `SELECT r.id, r.startAt, r.endAt, r.location, r.bandId, r.memo, r.userId,
+            u.name AS userName, u.studentId AS userStudentId, u.iconPath AS userIconPath,
+            b.name AS bandName
+     FROM \`Reservation\` r
+     INNER JOIN \`User\` u ON u.id = r.userId
+     LEFT JOIN \`Band\` b ON b.id = r.bandId
+     WHERE r.id = ?`,
+    [id],
+  );
+  const reservation = prevRows[0];
   if (!reservation) return res.status(404).json({ error: '予約が見つかりません' });
 
   const now = new Date();
@@ -154,7 +144,7 @@ router.patch('/:id', requireAuth, async (req, res) => {
     if (reservation.userId !== req.session.userId) {
       return res.status(403).json({ error: '他人の予約は編集できません' });
     }
-    if (reservation.startAt < now) {
+    if (new Date(reservation.startAt) < now) {
       return res.status(403).json({ error: '過去の予約は編集できません' });
     }
   } else {
@@ -165,58 +155,54 @@ router.patch('/:id', requireAuth, async (req, res) => {
   }
 
   const { startAt, endAt, location, bandId, memo } = req.body;
-  const data = {};
-  if (startAt != null) data.startAt = new Date(startAt);
-  if (endAt != null) data.endAt = new Date(endAt);
-  if (location != null) data.location = location;
-  if (bandId !== undefined) data.bandId = bandId || null;
-  if (memo !== undefined) data.memo = memo || null;
+  let finalStart = new Date(reservation.startAt);
+  let finalEnd = new Date(reservation.endAt);
+  let finalLocation = reservation.location;
+  let finalBandId = reservation.bandId;
+  let finalMemo = reservation.memo;
 
-  const finalStart = data.startAt || reservation.startAt;
-  const finalEnd = data.endAt || reservation.endAt;
-  const finalLocation = data.location || reservation.location;
+  if (startAt != null) finalStart = new Date(startAt);
+  if (endAt != null) finalEnd = new Date(endAt);
+  if (location != null) finalLocation = location;
+  if (bandId !== undefined) finalBandId = bandId || null;
+  if (memo !== undefined) finalMemo = memo || null;
 
   if (finalLocation === 'ROOM_802_FRONT') {
-    const overlap = await prisma.reservation.findFirst({
-      where: {
-        id: { not: id },
-        location: 'ROOM_802_FRONT',
-        startAt: { lt: finalEnd },
-        endAt: { gt: finalStart },
-      },
-    });
-    if (overlap) {
+    const [overlap] = await pool.query(
+      `SELECT id FROM \`Reservation\`
+       WHERE id != ? AND location = 'ROOM_802_FRONT' AND startAt < ? AND endAt > ? LIMIT 1`,
+      [id, finalEnd, finalStart],
+    );
+    if (overlap.length) {
       return res.status(400).json({ error: '802前方はこの時間帯に既に予約があります。重複予約はできません。' });
     }
   }
 
-  const updated = await prisma.reservation.update({
-    where: { id },
-    data: { ...data, startAt: finalStart, endAt: finalEnd, location: finalLocation },
-    include: {
-      user: { select: { id: true, name: true, studentId: true, iconPath: true } },
-      band: { select: { id: true, name: true } },
-    },
-  });
-  res.json({
-    reservation: {
-      id: updated.id,
-      startAt: updated.startAt.toISOString(),
-      endAt: updated.endAt.toISOString(),
-      location: updated.location,
-      band: updated.band,
-      memo: updated.memo,
-      user: updated.user,
-    },
-  });
+  await pool.execute(
+    `UPDATE \`Reservation\` SET startAt = ?, endAt = ?, location = ?, bandId = ?, memo = ? WHERE id = ?`,
+    [finalStart, finalEnd, finalLocation, finalBandId, finalMemo, id],
+  );
+
+  const [rows] = await pool.query(
+    `SELECT r.id, r.startAt, r.endAt, r.location, r.memo, r.userId, r.bandId,
+            u.name AS userName, u.studentId AS userStudentId, u.iconPath AS userIconPath,
+            b.name AS bandName
+     FROM \`Reservation\` r
+     INNER JOIN \`User\` u ON u.id = r.userId
+     LEFT JOIN \`Band\` b ON b.id = r.bandId
+     WHERE r.id = ?`,
+    [id],
+  );
+  res.json({ reservation: mapReservationRow(rows[0]) });
 });
 
-// 予約削除
 router.delete('/:id', requireAuth, async (req, res) => {
   const id = req.params.id;
-  const reservation = await prisma.reservation.findUnique({
-    where: { id },
-  });
+  const [rows] = await pool.query(
+    'SELECT id, userId, startAt FROM `Reservation` WHERE id = ?',
+    [id],
+  );
+  const reservation = rows[0];
   if (!reservation) return res.status(404).json({ error: '予約が見つかりません' });
 
   const now = new Date();
@@ -226,7 +212,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
     if (reservation.userId !== req.session.userId) {
       return res.status(403).json({ error: '他人の予約は削除できません' });
     }
-    if (reservation.startAt < now) {
+    if (new Date(reservation.startAt) < now) {
       return res.status(403).json({ error: '過去の予約は削除できません' });
     }
   } else {
@@ -236,7 +222,7 @@ router.delete('/:id', requireAuth, async (req, res) => {
     }
   }
 
-  await prisma.reservation.delete({ where: { id } });
+  await pool.execute('DELETE FROM `Reservation` WHERE id = ?', [id]);
   res.json({ ok: true });
 });
 

@@ -4,11 +4,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import sharp from 'sharp';
 import fs from 'fs';
-import { PrismaClient } from '@prisma/client';
+import { pool } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
+import { fetchUserWithBands } from './auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const prisma = new PrismaClient();
 const router = Router();
 const uploadsDir = path.join(__dirname, '..', '..', 'uploads');
 
@@ -33,7 +33,6 @@ function ensureUploadsDir() {
   return dir;
 }
 
-// Windows でファイルロック中に unlink すると EPERM になるため、失敗しても握りつぶす
 function safeUnlink(filePath) {
   try {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
@@ -42,7 +41,6 @@ function safeUnlink(filePath) {
   }
 }
 
-// アイコンアップロード（登録用・更新用）: 保存時に圧縮・リサイズ（失敗時は原寸のまま保存）
 router.post('/upload-icon', (req, res, next) => {
   upload.single('icon')(req, res, (err) => {
     if (err) {
@@ -85,12 +83,8 @@ router.post('/upload-icon', (req, res, next) => {
 
 router.use(requireAuth);
 
-// プロフィール取得（自分）
 router.get('/me', async (req, res) => {
-  const user = await prisma.user.findUnique({
-    where: { id: req.session.userId },
-    include: { bands: { include: { band: true } } },
-  });
+  const user = await fetchUserWithBands(req.session.userId);
   if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
   res.json({
     id: user.id,
@@ -99,64 +93,67 @@ router.get('/me', async (req, res) => {
     email: user.email,
     iconPath: user.iconPath,
     isAdmin: user.isAdmin,
-    instruments: JSON.parse(user.instruments),
-    bands: user.bands.map((ub) => ub.band),
+    instruments: user.instruments,
+    bands: user.bands,
   });
 });
 
-// 他ユーザーのプロフィール取得（閲覧用・公開情報のみ）
 router.get('/:id', async (req, res) => {
   const { id } = req.params;
   if (id === 'me') return res.status(400).json({ error: 'Use GET /me for own profile' });
-  const user = await prisma.user.findUnique({
-    where: { id },
-    include: { bands: { include: { band: true } } },
-  });
+  const user = await fetchUserWithBands(id);
   if (!user) return res.status(404).json({ error: 'ユーザーが見つかりません' });
   res.json({
     id: user.id,
     name: user.name,
     studentId: user.studentId,
     iconPath: user.iconPath,
-    instruments: JSON.parse(user.instruments),
-    bands: user.bands.map((ub) => ub.band),
+    instruments: user.instruments,
+    bands: user.bands,
   });
 });
 
-// プロフィール更新
 router.patch('/me', async (req, res) => {
   const { name, email, bandIds, instruments, iconPath } = req.body;
-  const data = {};
-  if (name != null) data.name = name;
-  if (email != null) {
-    const existing = await prisma.user.findFirst({
-      where: { email, id: { not: req.session.userId } },
-    });
-    if (existing) return res.status(400).json({ error: 'このメールアドレスは既に使用されています' });
-    data.email = email;
+  const updates = [];
+  const params = [];
+
+  if (name != null) {
+    updates.push('name = ?');
+    params.push(name);
   }
-  if (iconPath != null) data.iconPath = iconPath;
+  if (email != null) {
+    const [existing] = await pool.query(
+      'SELECT id FROM `User` WHERE email = ? AND id != ? LIMIT 1',
+      [email, req.session.userId],
+    );
+    if (existing.length) return res.status(400).json({ error: 'このメールアドレスは既に使用されています' });
+    updates.push('email = ?');
+    params.push(email);
+  }
+  if (iconPath != null) {
+    updates.push('iconPath = ?');
+    params.push(iconPath);
+  }
   if (instruments != null) {
     const inst = Array.isArray(instruments) ? instruments : JSON.parse(instruments);
     if (!inst.length) return res.status(400).json({ error: '担当楽器を1つ以上選択してください' });
-    data.instruments = JSON.stringify(inst);
+    updates.push('instruments = ?');
+    params.push(JSON.stringify(inst));
   }
-  const user = await prisma.user.update({
-    where: { id: req.session.userId },
-    data,
-    include: { bands: { include: { band: true } } },
-  });
+
+  if (updates.length) {
+    params.push(req.session.userId);
+    await pool.query(`UPDATE \`User\` SET ${updates.join(', ')} WHERE id = ?`, params);
+  }
+
   if (bandIds != null) {
-    await prisma.userBand.deleteMany({ where: { userId: req.session.userId } });
+    await pool.execute('DELETE FROM `UserBand` WHERE userId = ?', [req.session.userId]);
     if (bandIds.length) {
-      await prisma.userBand.createMany({
-        data: bandIds.map((bandId) => ({ userId: req.session.userId, bandId })),
-      });
+      const values = bandIds.map((bandId) => [req.session.userId, bandId]);
+      await pool.query('INSERT INTO `UserBand` (userId, bandId) VALUES ?', [values]);
     }
-    const updated = await prisma.user.findUnique({
-      where: { id: req.session.userId },
-      include: { bands: { include: { band: true } } },
-    });
+    const updated = await fetchUserWithBands(req.session.userId);
     return res.json({
       id: updated.id,
       name: updated.name,
@@ -164,10 +161,12 @@ router.patch('/me', async (req, res) => {
       email: updated.email,
       iconPath: updated.iconPath,
       isAdmin: updated.isAdmin,
-      instruments: JSON.parse(updated.instruments),
-      bands: updated.bands.map((ub) => ub.band),
+      instruments: updated.instruments,
+      bands: updated.bands,
     });
   }
+
+  const user = await fetchUserWithBands(req.session.userId);
   res.json({
     id: user.id,
     name: user.name,
@@ -175,8 +174,8 @@ router.patch('/me', async (req, res) => {
     email: user.email,
     iconPath: user.iconPath,
     isAdmin: user.isAdmin,
-    instruments: JSON.parse(user.instruments),
-    bands: user.bands.map((ub) => ub.band),
+    instruments: user.instruments,
+    bands: user.bands,
   });
 });
 
